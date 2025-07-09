@@ -46,7 +46,10 @@ python3 miniffuf.py -u <URL> -w <wordlist>
 | `-d, --data` | POST data | `-d "username=FUZZ&password=admin"` |
 | `--skip-after` | Skip combinations sau khi match filter | `--skip-after PASS` |
 | `-fc, --filter-codes` | Lọc status codes | `-fc 404,500` |
+| `-ec, --exclude-code` | Loại trừ status codes | `-ec 404,400` |
 | `-fs, --filter-size` | Lọc response size | `-fs 1234,5678` |
+| `-es, --exclude-size` | Loại trừ response size | `-es 1234,5678` |
+
 
 ### Ví dụ sử dụng
 

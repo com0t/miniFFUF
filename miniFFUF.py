@@ -4,13 +4,15 @@ import threading
 import time
 import argparse
 import sys
-from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
 import signal
 import itertools
-from pathlib import Path
+import re
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 class MiniFFUF:
-    def __init__(self, url, wordlists, threads=10, timeout=10, skip_after_placeholder=None):
+    def __init__(self, url, wordlists, threads=10, timeout=10, skip_after_placeholder=None, debug=False):
         self.url = url
         self.wordlists = wordlists  # Dict: {placeholder: wordlist_file}
         self.threads = threads
@@ -24,6 +26,7 @@ class MiniFFUF:
         self.skip_after_placeholder = skip_after_placeholder
         self.found_values = set()
         self.lock = threading.Lock()
+        self.debug = debug
 
         # Thiết lập User-Agent mặc định
         self.session.headers.update({
@@ -118,9 +121,61 @@ class MiniFFUF:
             with self.lock:
                 self.found_values.add(replacements[self.skip_after_placeholder])
 
+    def debug_print_request(self, method, target_url, headers, data, replacements):
+        """In thông tin request khi debug mode"""
+        if not self.debug:
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"[DEBUG] REQUEST - {self.format_replacements(replacements)}")
+        print(f"{'='*60}")
+        print(f"Method: {method}")
+        print(f"URL: {target_url}")
+        
+        if headers:
+            print("Headers:")
+            for key, value in headers.items():
+                print(f"  {key}: {value}")
+        
+        if data:
+            print(f"Data: {data}")
+        
+        print(f"{'='*60}")
+
+    def debug_print_response(self, response, result):
+        """In thông tin response khi debug mode"""
+        if not self.debug:
+            return
+        
+        print(f"\n{'-'*60}")
+        print(f"[DEBUG] RESPONSE")
+        print(f"{'-'*60}")
+        print(f"Status Code: {response.status_code}")
+        print(f"Response Length: {result['length']} bytes")
+        print(f"Response Time: {result['response_time']:.2f}s")
+        
+        print("Response Headers:")
+        for key, value in response.headers.items():
+            print(f"  {key}: {value}")
+        
+        # In một phần của response body (giới hạn để tránh spam)
+        if hasattr(response, 'content'):
+            content_preview = response.content[:500]  # Chỉ in 500 bytes đầu
+            try:
+                # Thử decode thành text
+                text_preview = content_preview.decode('utf-8', errors='ignore')
+                print("Response Body (first 500 chars):")
+                print(text_preview)
+            except:
+                print("Response Body (binary content - first 500 bytes):")
+                print(content_preview)
+        
+        print(f"{'-'*60}\n")
+
     def make_request(self, replacements, method='GET', headers=None, data=None):
         """Thực hiện HTTP request với replacements"""
         target_url = None
+        response = None
         try:
             # Thay thế placeholders trong URL
             target_url = self.replace_placeholders(self.url, replacements)
@@ -138,6 +193,9 @@ class MiniFFUF:
             if data:
                 req_data = self.replace_placeholders(data, replacements)
 
+            # Debug print request
+            self.debug_print_request(method, target_url, req_headers, req_data, replacements)
+
             # Gửi request
             if method.upper() == 'POST':
                 response = self.session.post(
@@ -145,49 +203,144 @@ class MiniFFUF:
                     headers=req_headers,
                     data=req_data,
                     timeout=self.timeout,
-                    allow_redirects=False
+                    allow_redirects=False,
+                    verify=False
                 )
             else:
                 response = self.session.get(
                     target_url,
                     headers=req_headers,
                     timeout=self.timeout,
-                    allow_redirects=False
+                    allow_redirects=False,
+                    verify=False
                 )
 
-            return {
+            # Lưu response body để có thể filter
+            try:
+                response_text = response.text
+            except:
+                response_text = response.content.decode('utf-8', errors='ignore')
+
+            result = {
                 'replacements': replacements,
                 'url': target_url,
                 'status_code': response.status_code,
                 'length': len(response.content),
-                'response_time': response.elapsed.total_seconds()
+                'response_time': response.elapsed.total_seconds(),
+                'response_text': response_text,
+                'response_object': response  # Lưu response object để debug
             }
 
+            # Debug print response
+            self.debug_print_response(response, result)
+
+            return result
+
         except requests.exceptions.RequestException as e:
-            return {
+            result = {
                 'replacements': replacements,
                 'url': target_url if target_url else self.url,
                 'status_code': 0,
                 'length': 0,
                 'response_time': 0,
+                'response_text': '',
                 'error': str(e)
             }
+            
+            if self.debug:
+                print(f"\n[DEBUG] REQUEST ERROR - {self.format_replacements(replacements)}")
+                print(f"Error: {str(e)}")
+                print(f"URL: {target_url if target_url else self.url}\n")
+            
+            return result
 
-    def filter_results(self, result, filter_codes=None, exclude_codes=None, filter_size=None, exclude_size=None):
-        """Lọc kết quả theo status code và size"""
+    def match_response_content(self, response_text, match_text=None, match_regex=None, exclude_text=None, exclude_regex=None):
+        """Kiểm tra match/exclude trong response content"""
+        if not response_text:
+            return False
+        
+        # Kiểm tra match text (phải có ít nhất một từ match)
+        if match_text:
+            found_match = False
+            for text in match_text:
+                if text.lower() in response_text.lower():
+                    found_match = True
+                    break
+            if not found_match:
+                return False
+        
+        # Kiểm tra match regex (phải có ít nhất một regex match)
+        if match_regex:
+            found_match = False
+            for pattern in match_regex:
+                try:
+                    if re.search(pattern, response_text, re.IGNORECASE | re.MULTILINE):
+                        found_match = True
+                        break
+                except re.error:
+                    print(f"[!] Invalid regex pattern: {pattern}")
+                    continue
+            if not found_match:
+                return False
+        
+        # Kiểm tra exclude text (nếu có bất kỳ từ nào thì loại trừ)
+        if exclude_text:
+            for text in exclude_text:
+                if text.lower() in response_text.lower():
+                    return False
+        
+        # Kiểm tra exclude regex (nếu có bất kỳ regex nào match thì loại trừ)
+        if exclude_regex:
+            for pattern in exclude_regex:
+                try:
+                    if re.search(pattern, response_text, re.IGNORECASE | re.MULTILINE):
+                        return False
+                except re.error:
+                    print(f"[!] Invalid regex pattern: {pattern}")
+                    continue
+        
+        return True
+
+    def filter_results(self, result, filter_codes=None, exclude_codes=None, filter_size=None, exclude_size=None, 
+                      match_text=None, match_regex=None, exclude_text=None, exclude_regex=None):
+        """Lọc kết quả theo status code, size và response content"""
         is_filtered = False
+        
+        # Logic cũ cho status code và size
+        if not filter_codes and not filter_size and not exclude_codes and not exclude_size and not match_text and not match_regex:
+            is_filtered = True
+        else:
+            # Kiểm tra filter status codes
+            if filter_codes and result['status_code'] in filter_codes:
+                is_filtered = True
+            
+            # Kiểm tra filter size
+            if filter_size and result['length'] in filter_size:
+                is_filtered = True
+            
+            # Kiểm tra exclude status codes
+            if exclude_codes and result['status_code'] not in exclude_codes:
+                is_filtered = True
+            
+            # Kiểm tra exclude size
+            if exclude_size and result['length'] not in exclude_size:
+                is_filtered = True
+            
+            # Nếu không có filter status/size nào được set, default là true
+            if not filter_codes and not filter_size and not exclude_codes and not exclude_size:
+                is_filtered = True
 
-        if not filter_codes and not filter_size and not exclude_codes and not exclude_size:
-            is_filtered = True
-        if filter_codes and result['status_code'] in filter_codes:
-            is_filtered = True
-        if filter_size and result['length'] in filter_size:
-            is_filtered = True
-
-        if exclude_codes and result['status_code'] not in exclude_codes:
-            is_filtered = True
-        if exclude_size and result['length'] not in exclude_size:
-            is_filtered = True
+        # Kiểm tra response content matching
+        if (match_text or match_regex or exclude_text or exclude_regex):
+            response_text = result.get('response_text', '')
+            content_match = self.match_response_content(response_text, match_text, match_regex, exclude_text, exclude_regex)
+            
+            # Nếu có filter content thì phải pass cả status/size và content
+            if (match_text or match_regex):
+                is_filtered = is_filtered and content_match
+            else:
+                # Chỉ có exclude content thì áp dụng exclude
+                is_filtered = is_filtered and content_match
 
         # Nếu kết quả bị lọc và có skip_after_placeholder, thêm vào found_values
         if is_filtered:
@@ -197,7 +350,7 @@ class MiniFFUF:
 
     def print_progress(self):
         """In tiến trình fuzzing"""
-        if self.start_time:
+        if not self.debug and self.start_time:  # Không in progress khi debug mode
             elapsed = time.time() - self.start_time
             rps = self.completed_requests / elapsed if elapsed > 0 else 0
             progress = (self.completed_requests / self.total_requests) * 100 if self.total_requests > 0 else 0
@@ -208,7 +361,8 @@ class MiniFFUF:
         """Format replacements để hiển thị"""
         return " | ".join([f"{k}: {v}" for k, v in replacements.items()])
 
-    def worker(self, replacements, method, headers, data, filter_codes, exclude_codes, filter_size, exclude_size):
+    def worker(self, replacements, method, headers, data, filter_codes, exclude_codes, filter_size, exclude_size,
+              match_text, match_regex, exclude_text, exclude_regex):
         """Worker function cho threading"""
         if not self.running:
             return
@@ -226,19 +380,25 @@ class MiniFFUF:
             self.completed_requests += 1
 
         # Lọc kết quả
-        if self.filter_results(result, filter_codes, exclude_codes, filter_size, exclude_size):
+        if self.filter_results(result, filter_codes, exclude_codes, filter_size, exclude_size,
+                              match_text, match_regex, exclude_text, exclude_regex):
             with self.lock:
                 self.results.append(result)
 
-            # In kết quả ngay lập tức
-            status_color = self.get_status_color(result['status_code'])
-            replacements_str = self.format_replacements(result['replacements'])
+            # In kết quả ngay lập tức (không in khi debug mode để tránh spam)
+            if not self.debug:
+                status_color = self.get_status_color(result['status_code'])
+                replacements_str = self.format_replacements(result['replacements'])
 
-            print(f"\n{status_color}[Status: {result['status_code']}] "
-                  f"[Size: {result['length']}] "
-                  f"[Time: {result['response_time']:.2f}s] "
-                  f"[{replacements_str}] "
-                  f"-> {result['url']}\033[0m")
+                print(f"\n{status_color}[Status: {result['status_code']}] "
+                      f"[Size: {result['length']}] "
+                      f"[Time: {result['response_time']:.2f}s] "
+                      f"[{replacements_str}] "
+                      f"-> {result['url']}\033[0m")
+            else:
+                # Trong debug mode, chỉ in kết quả match một cách đơn giản
+                print(f"\n[MATCH] Status: {result['status_code']} | Size: {result['length']} | {self.format_replacements(result['replacements'])} | {result['url']}")
+        
         with self.lock:
             self.print_progress()
 
@@ -255,7 +415,8 @@ class MiniFFUF:
         else:
             return '\033[94m'  # Blue
 
-    def run(self, method='GET', headers=None, data=None, filter_codes=None, exclude_codes=None, filter_size=None, exclude_size=None):
+    def run(self, method='GET', headers=None, data=None, filter_codes=None, exclude_codes=None, filter_size=None, exclude_size=None,
+           match_text=None, match_regex=None, exclude_text=None, exclude_regex=None):
         """Chạy fuzzing"""
         # Tính tổng số requests
         self.total_requests = self.calculate_total_requests()
@@ -265,6 +426,7 @@ class MiniFFUF:
         print(f"[+] Method: {method}")
         print(f"[+] Threads: {self.threads}")
         print(f"[+] Total combinations: {self.total_requests}")
+        print(f"[+] Debug mode: {'ON' if self.debug else 'OFF'}")
 
         if self.skip_after_placeholder:
             print(f"[+] Skip after placeholder: {self.skip_after_placeholder}")
@@ -273,6 +435,16 @@ class MiniFFUF:
             print(f"[+] Headers: {headers}")
         if data:
             print(f"[+] Data: {data}")
+
+        # In thông tin filter content
+        if match_text:
+            print(f"[+] Match text: {match_text}")
+        if match_regex:
+            print(f"[+] Match regex: {match_regex}")
+        if exclude_text:
+            print(f"[+] Exclude text: {exclude_text}")
+        if exclude_regex:
+            print(f"[+] Exclude regex: {exclude_regex}")
 
         # Kiểm tra placeholders được sử dụng
         self.check_used_placeholders(headers, data)
@@ -297,7 +469,8 @@ class MiniFFUF:
                         continue
 
                     future = executor.submit(
-                        self.worker, replacements, method, headers, data, filter_codes, exclude_codes, filter_size, exclude_size
+                        self.worker, replacements, method, headers, data, filter_codes, exclude_codes, filter_size, exclude_size,
+                        match_text, match_regex, exclude_text, exclude_regex
                     )
                     futures.append(future)
 
@@ -354,6 +527,7 @@ class MiniFFUF:
                     used_placeholders.append(placeholder)
 
         print(f"[+] Used placeholders: {list(set(used_placeholders))}")
+
 def parse_wordlist_argument(arg):
     """Parse wordlist argument dạng 'placeholder:file' hoặc chỉ 'file'"""
     if ':' in arg:
@@ -361,6 +535,7 @@ def parse_wordlist_argument(arg):
         return placeholder, wordlist_file
     else:
         return 'FUZZ', arg
+
 def main():
     parser = argparse.ArgumentParser(description='Mini FFUF - Python Web Fuzzer với Multiple Wordlists')
     parser.add_argument('-u', '--url', required=True, help='Target URL (sử dụng placeholders)')
@@ -376,6 +551,13 @@ def main():
     parser.add_argument('-ec', '--exclude-codes', help='Loại trừ status codes (VD: 404,500)')
     parser.add_argument('-fs', '--filter-size', help='Lọc response size (VD: 1234,5678)')
     parser.add_argument('-es', '--exclude-size', help='Loại trừ response size (VD: 1234,5678)')
+    parser.add_argument('--debug', action='store_true', help='Bật debug mode để in chi tiết request/response')
+    
+    # Response content filtering options
+    parser.add_argument('-mt', '--match-text', help='Match text trong response (phân cách bằng dấu phẩy)')
+    parser.add_argument('-mr', '--match-regex', help='Match regex pattern trong response (phân cách bằng dấu phẩy)')
+    parser.add_argument('-et', '--exclude-text', help='Exclude text trong response (phân cách bằng dấu phẩy)')
+    parser.add_argument('-er', '--exclude-regex', help='Exclude regex pattern trong response (phân cách bằng dấu phẩy)')
 
     args = parser.parse_args()
 
@@ -425,6 +607,23 @@ def main():
     if args.exclude_size:
         exclude_size = [int(size.strip()) for size in args.exclude_size.split(',')]
 
+    # Xử lý response content filters
+    match_text = None
+    if args.match_text:
+        match_text = [text.strip() for text in args.match_text.split(',')]
+
+    match_regex = None
+    if args.match_regex:
+        match_regex = [pattern.strip() for pattern in args.match_regex.split(',')]
+
+    exclude_text = None
+    if args.exclude_text:
+        exclude_text = [text.strip() for text in args.exclude_text.split(',')]
+
+    exclude_regex = None
+    if args.exclude_regex:
+        exclude_regex = [pattern.strip() for pattern in args.exclude_regex.split(',')]
+
     # Kiểm tra skip-after placeholder
     skip_after_placeholder = args.skip_after
     if skip_after_placeholder and skip_after_placeholder not in wordlists:
@@ -433,7 +632,7 @@ def main():
         sys.exit(1)
 
     # Tạo và chạy fuzzer
-    fuzzer = MiniFFUF(args.url, wordlists, args.threads, args.timeout, skip_after_placeholder)
+    fuzzer = MiniFFUF(args.url, wordlists, args.threads, args.timeout, skip_after_placeholder, args.debug)
     fuzzer.run(
         method=args.method,
         headers=headers if headers else None,
@@ -441,7 +640,12 @@ def main():
         filter_codes=filter_codes,
         exclude_codes=exclude_codes,
         filter_size=filter_size,
-        exclude_size=exclude_size
+        exclude_size=exclude_size,
+        match_text=match_text,
+        match_regex=match_regex,
+        exclude_text=exclude_text,
+        exclude_regex=exclude_regex
     )
+
 if __name__ == '__main__':
     main()

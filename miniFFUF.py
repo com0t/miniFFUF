@@ -173,7 +173,7 @@ class MiniFFUF:
         print(f"{'-'*60}\n")
 
     def make_request(self, replacements, method='GET', headers=None, data=None):
-        """Thực hiện HTTP request với replacements"""
+        """Thực hiện HTTP request với replacements sử dụng prepared request"""
         target_url = None
         response = None
         try:
@@ -196,24 +196,27 @@ class MiniFFUF:
             # Debug print request
             self.debug_print_request(method, target_url, req_headers, req_data, replacements)
 
-            # Gửi request
-            if method.upper() == 'POST':
-                response = self.session.post(
-                    target_url,
-                    headers=req_headers,
-                    data=req_data,
-                    timeout=self.timeout,
-                    allow_redirects=False,
-                    verify=False
-                )
-            else:
-                response = self.session.get(
-                    target_url,
-                    headers=req_headers,
-                    timeout=self.timeout,
-                    allow_redirects=False,
-                    verify=False
-                )
+            # Tạo prepared request
+            req = requests.Request(
+                method=method.upper(),
+                url=target_url,
+                headers=req_headers,
+                data=req_data
+            )
+            
+            # Prepare request
+            prepared = self.session.prepare_request(req)
+            
+            # Đảm bảo URL gốc được giữ nguyên
+            prepared.url = target_url
+            
+            # Gửi prepared request
+            response = self.session.send(
+                prepared,
+                timeout=self.timeout,
+                allow_redirects=False,
+                verify=False
+            )
 
             # Lưu response body để có thể filter
             try:
